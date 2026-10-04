@@ -32,7 +32,10 @@ class BrainParams:
     t_dly: float = 1.8       # ms, synaptic delay
     w_syn: float = 0.275     # mV per synapse
     f_poi: float = 250.0     # Poisson input weight = w_syn * f_poi
-
+    # Spike-frequency adaptation (not in the paper; adapt_b = 0 reproduces it exactly).
+    # Each spike adds adapt_b mV of hyperpolarizing current that decays with adapt_tau.
+    adapt_b: float = 0.0     # mV per spike
+    adapt_tau: float = 300.0 # ms
 
 
 class Brain:
@@ -74,6 +77,9 @@ class Brain:
         self.a_m = math.exp(-dt / params.t_mbr)
         self.a_s = math.exp(-dt / params.tau)
         self.k = params.tau / (params.tau - params.t_mbr)  # g -> v coupling
+        self.a_a = math.exp(-dt / params.adapt_tau)
+        self.k_a = params.adapt_tau / (params.adapt_tau - params.t_mbr)  # adaptation -> v
+        self.adapt = params.adapt_b > 0
 
         self.delay_steps = max(1, round(params.t_dly / dt))
         self.rfc_steps = round(params.t_rfc / dt)
@@ -90,6 +96,7 @@ class Brain:
         n, b, d = self.n, self.batch, self.device
         self.v = torch.full((n, b), self.p.v_0, device=d)
         self.g = torch.zeros(n, b, device=d)
+        self.w = torch.zeros(n, b, device=d)  # adaptation current (mV)
         self.rfc = torch.zeros(n, b, device=d, dtype=torch.int32)  # steps left
         # ring buffer of spikes waiting out the synaptic delay
         self.buf = torch.zeros(self.delay_steps, n, b, device=d)
@@ -135,6 +142,9 @@ class Brain:
         active = self.rfc <= 0
         u = self.v - p.v_0
         u_new = self.k * self.g * (self.a_s - self.a_m) + u * self.a_m
+        if self.adapt:  # dv/dt gets -w/t_mbr; w decays independently of refractoriness
+            u_new -= self.k_a * self.w * (self.a_a - self.a_m)
+            self.w *= self.a_a
         self.v = torch.where(active, p.v_0 + u_new, self.v)
         self.g = torch.where(active, self.g * self.a_s, self.g)
 
@@ -149,6 +159,8 @@ class Brain:
         spiked = self.v > p.v_th
         self.v = torch.where(spiked, torch.full_like(self.v, p.v_rst), self.v)
         self.g = torch.where(spiked, torch.zeros_like(self.g), self.g)
+        if self.adapt:
+            self.w += spiked * p.adapt_b
         self.rfc = torch.where(spiked, self.rfc_steps, self.rfc - 1).to(torch.int32)
         if poisson_target is not None:  # driven neurons have no refractory period
             self.rfc[poisson_target] = 0

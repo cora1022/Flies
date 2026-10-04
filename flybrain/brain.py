@@ -60,6 +60,15 @@ class Brain:
         self.W = torch.sparse_coo_tensor(
             torch.stack([post, pre]), w * params.w_syn, (n, n)
         ).coalesce().to_sparse_csr().to(self.device)
+        # the same weights indexed by presynaptic neuron, for event-driven propagation:
+        # only a few dozen of the ~139k neurons spike per step, so gathering their
+        # outgoing synapses is far cheaper than a full sparse matrix product
+        WT = torch.sparse_coo_tensor(torch.stack([pre, post]), w * params.w_syn, (n, n)).coalesce().to_sparse_csr()
+        self.out_ptr = WT.crow_indices().to(self.device)
+        self.out_post = WT.col_indices().to(self.device)
+        self.out_w = WT.values().to(self.device)
+        self.event_driven = True
+
         # exact integration of the linear (v, g) system over one step
         dt = params.dt
         self.a_m = math.exp(-dt / params.t_mbr)
@@ -116,8 +125,11 @@ class Brain:
         # spikes emitted `delay_steps` ago arrive now
         slot = self.t_step % self.delay_steps
         arriving = self.buf[slot]
-        self.g += torch.sparse.mm(self.W, arriving) if self.batch > 1 else \
-            torch.mv(self.W, arriving[:, 0]).unsqueeze(1)
+        if self.event_driven:
+            self._propagate(arriving)
+        else:
+            self.g += torch.sparse.mm(self.W, arriving) if self.batch > 1 else \
+                torch.mv(self.W, arriving[:, 0]).unsqueeze(1)
 
         # integrate neurons that are not refractory
         active = self.rfc <= 0
@@ -145,6 +157,21 @@ class Brain:
         self.buf[slot] = out.float()
         self.t_step += 1
         return out
+
+    def _propagate(self, arriving: torch.Tensor):
+        """g[post, b] += w for every synapse of every neuron that spiked in column b."""
+        ev = torch.nonzero(arriving)  # (k, 2): presynaptic index, batch column
+        if len(ev) == 0:
+            return
+        pre, col = ev[:, 0], ev[:, 1]
+        start = self.out_ptr[pre]
+        cnt = self.out_ptr[pre + 1] - start
+        csum = torch.cumsum(cnt, 0)
+        total = int(csum[-1])
+        which = torch.repeat_interleave(torch.arange(len(ev), device=self.device), cnt, output_size=total)
+        pos = start[which] + torch.arange(total, device=self.device) - (csum - cnt)[which]
+        flat = self.out_post[pos] * self.batch + col[which]
+        self.g.view(-1).index_add_(0, flat, self.out_w[pos])
 
     @torch.no_grad()
     def run(self, ms: float, record: torch.Tensor | None = None) -> torch.Tensor:
